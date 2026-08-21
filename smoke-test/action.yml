@@ -1,0 +1,85 @@
+name: Application Smoke Test
+
+description: Start an application container, wait for its health endpoint to respond, and report the result.
+
+inputs:
+  image:
+    description: "Image reference to run. Must already be present in the local Docker daemon (build with load: true)."
+    required: true
+
+  container-port:
+    description: "Port the application listens on inside the container."
+    required: true
+
+  health-path:
+    description: "HTTP path polled until it returns a 2xx response."
+    required: false
+    default: "/health"
+
+  timeout:
+    description: "Seconds to wait for the health endpoint before failing."
+    required: false
+    default: "60"
+
+  interval:
+    description: "Seconds to wait between health check attempts."
+    required: false
+    default: "3"
+
+outputs:
+  reason:
+    description: "Human-readable result of the smoke test, set on both success and failure."
+    value: ${{ steps.test.outputs.reason }}
+
+runs:
+  using: composite
+  steps:
+    - name: Run smoke test
+      id: test
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        PORT: ${{ inputs.container-port }}
+        HEALTH_PATH: ${{ inputs.health-path }}
+        TIMEOUT: ${{ inputs.timeout }}
+        INTERVAL: ${{ inputs.interval }}
+      run: |
+        set -u
+        say() { printf 'reason=%s\n' "$1" >> "$GITHUB_OUTPUT"; }
+
+        # Publish the container port on a random loopback port. The double colon is
+        # required: "127.0.0.1:8001" parses as hostPort=127.0.0.1, which is invalid.
+        CID=$(docker run -d -p "127.0.0.1::${PORT}" "${IMAGE}") || {
+          say "Container failed to start"; exit 1; }
+
+        cleanup() {
+          echo "::group::Container logs (${IMAGE})"
+          docker logs --tail 200 "${CID}" 2>&1 || true
+          echo "::endgroup::"
+          docker rm -f "${CID}" >/dev/null 2>&1 || true
+        }
+        trap cleanup EXIT
+
+        HOST_PORT=$(docker port "${CID}" "${PORT}/tcp" 2>/dev/null | head -1 | sed 's/.*://') || HOST_PORT=""
+        if [ -z "${HOST_PORT}" ]; then
+          say "Container port ${PORT} was never published"; exit 1
+        fi
+
+        URL="http://127.0.0.1:${HOST_PORT}${HEALTH_PATH}"
+        echo "Started ${IMAGE} -> ${URL}"
+
+        DEADLINE=$(( SECONDS + TIMEOUT ))
+        while :; do
+          if [ "$(docker inspect -f '{{.State.Running}}' "${CID}" 2>/dev/null)" != "true" ]; then
+            say "Container exited prematurely"; exit 1
+          fi
+          if curl -fsS --max-time 5 "${URL}" >/dev/null 2>&1; then
+            echo "Healthy after ${SECONDS}s"
+            say "Application started and healthy"; exit 0
+          fi
+          [ "${SECONDS}" -ge "${DEADLINE}" ] && break
+          sleep "${INTERVAL}"
+        done
+
+        say "Health check failed after ${TIMEOUT}s"
+        exit 1
